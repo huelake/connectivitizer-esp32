@@ -1,0 +1,2 @@
+# Wi-Fi, TLS and an HTTP server together are a little over 1 MB on the newer chips: use the 1.5 MB app partition.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y

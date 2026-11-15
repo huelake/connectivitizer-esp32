@@ -1,0 +1,14 @@
+version: "1.0.33"
+description: Reach a web server on your ESP32 from your app, from anywhere, without opening a port. End-to-end encrypted, through a relay or peer to peer.
+url: https://connectivitizer.com
+repository: https://github.com/huelake/connectivitizer-esp32.git
+documentation: https://connectivitizer.com/docs
+issues: https://github.com/huelake/connectivitizer-esp32/issues
+license: MIT
+maintainers:
+  - Huelake <info@huelake.com>
+files:
+  exclude:
+    - "host/**/*"
+dependencies:
+  idf: ">=4.4"

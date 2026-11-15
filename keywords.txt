@@ -1,0 +1,13 @@
+Connectivitizer	KEYWORD1
+begin	KEYWORD2
+end	KEYWORD2
+setServer	KEYWORD2
+setSharedKey	KEYWORD2
+expose	KEYWORD2
+setPeerToPeer	KEYWORD2
+setRootCA	KEYWORD2
+setLog	KEYWORD2
+connected	KEYWORD2
+refused	KEYWORD2
+sessions	KEYWORD2
+lastError	KEYWORD2

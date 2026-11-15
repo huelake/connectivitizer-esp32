@@ -1,0 +1,30 @@
+{
+  "name": "Connectivitizer",
+  "version": "1.0.33",
+  "description": "Reach a web server on your ESP32 from your app, from anywhere, without opening a port: end-to-end encrypted, through a relay or peer to peer. No other library needed.",
+  "keywords": "esp32, remote access, nat, peer-to-peer, tunnel, websocket, http",
+  "homepage": "https://connectivitizer.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/huelake/connectivitizer-esp32.git"
+  },
+  "license": "MIT",
+  "authors": [
+    {
+      "name": "Huelake",
+      "email": "info@huelake.com",
+      "url": "https://huelake.com",
+      "maintainer": true
+    }
+  ],
+  "frameworks": ["arduino", "espidf"],
+  "platforms": ["espressif32"],
+  "headers": ["Connectivitizer.h", "cz.h"],
+  "build": {
+    "srcDir": "src",
+    "includeDir": "src"
+  },
+  "export": {
+    "exclude": ["host"]
+  }
+}
