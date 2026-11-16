@@ -1943,6 +1943,16 @@ static void signal_pump(cz_agent *agent)
 
 /* ---- Connecting to the platform ------------------------------------------------------------ */
 
+/* The next connection attempt: a random time between half and the whole back-off. A fleet refused or dropped together
+ * (an outage, a restart, the platform shedding load) must not come back together: with little or no jitter it came
+ * back in waves that the platform could not take, with nothing to do in between. */
+static void schedule_retry(cz_agent *agent)
+{
+    uint8_t jitter[2];
+    cz_random(jitter, sizeof jitter);
+    agent->next_attempt = cz_millis() + agent->backoff / 2 + (uint32_t)(((jitter[0] << 8) | jitter[1]) % (agent->backoff / 2 + 1));
+}
+
 static void agent_connect(cz_agent *agent)
 {
     /* 1. Log in with the device key and the name: the answer is a short-lived token. */
@@ -2047,10 +2057,7 @@ void cz_agent_poll(cz_agent *agent, int max_wait_ms)
         } else {
             agent_connect(agent);
             if (!agent->signal_open && agent->state != CZ_STATE_REFUSED) {
-                uint8_t jitter[2];
-                cz_random(jitter, sizeof jitter);
-                /* Jitter keeps a fleet of devices from reconnecting in the same instant after an outage. */
-                agent->next_attempt = cz_millis() + agent->backoff + (uint32_t)(((jitter[0] << 8) | jitter[1]) % 500);
+                schedule_retry(agent);
                 agent->backoff = agent->backoff * 2 > 30000 ? 30000 : agent->backoff * 2;
             }
         }
@@ -2125,7 +2132,7 @@ void cz_agent_poll(cz_agent *agent, int max_wait_ms)
             }
         }
         if (!agent->signal_open) {
-            agent->next_attempt = cz_millis() + agent->backoff;
+            schedule_retry(agent);
         }
     }
 

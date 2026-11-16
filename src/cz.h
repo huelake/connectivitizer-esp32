@@ -20,7 +20,7 @@
 extern "C" {
 #endif
 
-#define CZ_VERSION "1.0.33"
+#define CZ_VERSION "1.0.50"
 
 /* Limits. They decide how much memory an agent uses; change them with compiler definitions. */
 #ifndef CZ_MAX_SERVICES

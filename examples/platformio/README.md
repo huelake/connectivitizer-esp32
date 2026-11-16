@@ -32,10 +32,6 @@ session â€¦ established with Example app (direct, shared-key, app at [2a01:598:â
 
 IPv6 addresses appear some time after the board joins the Wi-Fi, once the router has announced them; sessions before that offer IPv4 only. `learned` instead of `announced` means the app was reached at an address it could not announce itself. A relayed session prints why; [the troubleshooting guide](https://connectivitizer.com/guides/troubleshooting.md) explains the lines.
 
-## Against a development platform on your PC
-
-The ESP32 has to reach the platform by the PC's address in the network, not `localhost`. `src/connectivitizer-e2e/dev/run-lan.ps1 up` starts the platform that way and prints the API address; put it into `secrets.h` as `SERVER_URL`. The PC's firewall must let `dotnet.exe` accept connections (TCP 9021 and 9022, UDP 3478 and 3479), and a VPN on the PC must not hide it from the local network.
-
 ## In your own project
 
 Replace the `lib_deps` line of `platformio.ini` with `lib_deps = huelakesoftwaresolutions/Connectivitizer` (the library from the PlatformIO registry). Nothing else has to be installed.

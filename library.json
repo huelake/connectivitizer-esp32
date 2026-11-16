@@ -1,6 +1,6 @@
 {
   "name": "Connectivitizer",
-  "version": "1.0.33",
+  "version": "1.0.50",
   "description": "Reach a web server on your ESP32 from your app, from anywhere, without opening a port: end-to-end encrypted, through a relay or peer to peer. No other library needed.",
   "keywords": "esp32, remote access, nat, peer-to-peer, tunnel, websocket, http",
   "homepage": "https://connectivitizer.com",

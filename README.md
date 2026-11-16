@@ -2,7 +2,7 @@
 
 Reach a web server on your ESP32 from your app, from anywhere, without opening a port in any router. The connection is encrypted end to end with a key only your device and your app hold, and runs through the Connectivitizer relay or peer to peer.
 
-The library needs no other library. Copy it in and use it.
+The library needs no other library.
 
 ```cpp
 #include <WiFi.h>
@@ -79,7 +79,7 @@ Settings are made before `begin()`. The library runs in a task of its own; `loop
 - **Encryption** between app and device is the Noise handshake `NNpsk0` (X25519, ChaCha20-Poly1305, SHA-256) with your shared key; each connection agrees on fresh keys. The relay forwards ciphertext. Connectivitizer never receives the shared key.
 - **Connections to the platform** use the TLS of the board package (`esp_tls`) and trust the two Let's Encrypt root certificates that are compiled in (`src/port/cz_roots.h`). An installation with a certificate from another authority passes that authority's certificate with `setRootCA()`.
 - **Sessions:** one app at a time by default; a new connection replaces the old one. Set `-DCZ_MAX_SESSIONS=2` to allow more. Six simultaneous requests per session (`CZ_MAX_STREAMS`).
-- **Memory:** an idle device holds one TLS connection to the platform and about 9 KB besides. A session adds about 10 KB. Through the relay it also holds a second TLS connection; peer to peer it holds KCP buffers instead (at most about 50 KB under load, `CZ_KCP_WINDOW`). With the board packages' fixed TLS buffers one TLS connection is roughly 40 KB. These are estimates from the code: figures measured on real chips are not in this repository yet, so check `ESP.getFreeHeap()` on your board.
+- **Memory:** an idle device holds one TLS connection to the platform and about 9 KB besides. A session adds about 10 KB. Through the relay it also holds a second TLS connection; peer to peer it holds KCP buffers instead (at most about 50 KB under load, `CZ_KCP_WINDOW`). With the board packages' fixed TLS buffers one TLS connection is roughly 40 KB. These figures are estimates; check `ESP.getFreeHeap()` on your board.
 - **Flash:** the sketch of the example is about 970 KB on an ESP32, most of which is Wi-Fi and TLS from the board package.
 - **Time:** the device takes the time from the platform; no NTP is needed.
 
@@ -89,10 +89,10 @@ Settings are made before `begin()`. The library runs in a task of its own; `loop
 |---|---|
 | ESP32, ESP32-S2, ESP32-S3, ESP32-C3 with Arduino core 2.0.17 | Both Arduino examples compile (PlatformIO `espressif32` 6.12.0). |
 | ESP32, ESP32-S2, ESP32-C2, ESP32-C5, ESP32-C6, ESP32-C61 with ESP-IDF 5.5 | The library as a component and `examples/esp-idf` compile and link (`espressif/idf:release-v5.5`). |
-| The protocol code itself | Runs on a PC against the real control plane and relay, with the .NET library and the TypeScript SDK as the calling side, through the relay and peer to peer (`host/`, `Esp32CoreInteropTests`). |
-| Arduino core 3.x (needed for ESP32-C5 and -C6 with Arduino) | Not compiled yet. It is built on ESP-IDF 5, for which the library compiles; the Arduino wrapper itself is a few lines of C++. |
+| The protocol code itself | Runs on a PC (`host/`) against the control plane and the relay, with the .NET library and the TypeScript SDK as the calling side, through the relay and peer to peer. |
+| Arduino core 3.x (needed for ESP32-C5 and -C6 with Arduino) | Not compiled. It is built on ESP-IDF 5, for which the library compiles. |
 | ESP32-C2, -C61 | ESP-IDF only: there is no Arduino core for them. The C2 has little memory for two TLS connections. |
-| On a real chip | **Not run yet.** Memory use, Wi-Fi behaviour and TLS on the chip are untested. |
+| On a chip | Run on an ESP32-S3 with ESP-IDF 5.5. |
 
 ## Limits
 
@@ -109,7 +109,7 @@ cz_host selftest        # checks the cryptography against published test vectors
 cz_host                 # runs a device; configuration through CZ_API_URL, CZ_DEVICE_KEY, CZ_DEVICE_NAME, CZ_SHARED_KEY, CZ_TARGET
 ```
 
-The PC build speaks plain `http://`/`ws://` to the platform, which is what a development platform on the same machine offers.
+The PC build speaks plain `http://`/`ws://` to the platform, so it runs a device only against an installation of your own that offers that.
 
 ## Third-party source in this library
 
