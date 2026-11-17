@@ -1,7 +1,7 @@
 /*
  * The library on a PC: the same code that runs on the chip, as a program driven by its
  * environment. It is what the interoperability tests run against the other SDKs, and a way to
- * try the device side without hardware.
+ * try the library without hardware.
  *
  *   cz_host selftest          check the cryptography against published test vectors
  *   cz_host                   run a device:
@@ -9,6 +9,8 @@
  *     CZ_TARGET               host:port of the local application to expose as CZ_SERVICE (default api)
  *     CZ_DIRECT=none          never attempt a peer-to-peer connection
  *     CZ_LOOPBACK=true        offer 127.0.0.1 (both endpoints on one machine)
+ *     CZ_LINK                 device/service=port: that service of another device on a local port of this one
+ *     CZ_LINK_KEY             the shared key of that device, when it is not CZ_SHARED_KEY
  *
  * It prints READY once the platform sees the device, and its log after that. A line on stdin, or
  * stdin closing, stops it.
@@ -209,6 +211,25 @@ int main(int argc, char **argv)
     config.disable_peer_to_peer = strcmp(env("CZ_DIRECT", ""), "none") == 0;
     config.include_loopback = strcmp(env("CZ_LOOPBACK", ""), "true") == 0;
     config.log = log_line;
+
+    /* CZ_LINK=<device>/<service>=<port>: that service of another device on a local port of this one. */
+    char link_device[64] = "";
+    char link_service[64] = "";
+    const char *link = env("CZ_LINK", NULL);
+    if (link != NULL) {
+        const char *slash = strchr(link, '/');
+        const char *equals = slash != NULL ? strchr(slash, '=') : NULL;
+        if (equals == NULL || (size_t)(slash - link) >= sizeof link_device || (size_t)(equals - slash - 1) >= sizeof link_service) {
+            fprintf(stderr, "CZ_LINK must be device/service=port\n");
+            return 64;
+        }
+        memcpy(link_device, link, (size_t)(slash - link));
+        memcpy(link_service, slash + 1, (size_t)(equals - slash - 1));
+        config.links[0].device = link_device;
+        config.links[0].service = link_service;
+        config.links[0].local_port = (uint16_t)atoi(equals + 1);
+        config.links[0].shared_key = env("CZ_LINK_KEY", NULL);
+    }
 
     cz_agent *agent = cz_agent_create(&config);
     if (agent == NULL) {

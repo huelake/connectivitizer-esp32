@@ -10,6 +10,14 @@
  *
  * Nothing else is needed: the library runs in a task of its own, reconnects by itself, and the
  * device appears in your Connectivitizer workspace the first time it connects.
+ *
+ * The device can also call another device of the workspace:
+ *
+ *   Connectivitizer.link("cabin", "api", 8081);          // before begin()
+ *   int status = Connectivitizer.get("cabin", "/state", answer);
+ *
+ * The other device's service is then at 127.0.0.1:8081 on this device, for any library that
+ * speaks TCP. The device key needs "Its devices may open sessions to other devices".
  */
 #ifndef CONNECTIVITIZER_H
 #define CONNECTIVITIZER_H
@@ -41,6 +49,34 @@ public:
      */
     bool expose(const char *name, uint16_t port, const char *host = nullptr, const char *protocol = "http");
 
+    /**
+     * Makes a service of another device of your workspace reachable on a port of this device:
+     * after link("cabin", "api", 8081), whatever connects to 127.0.0.1:8081 talks to the service
+     * "api" of the device "cabin", end-to-end encrypted. The session to the other device is opened
+     * by the first connection and closed when the port has not been used for half a minute.
+     *
+     * Needs a device key whose devices may open sessions (set in the web app where the key is
+     * created). \`sharedKey\` is the key the other device holds; leave it out when it is the one
+     * given to setSharedKey first. Call it before begin().
+     */
+    bool link(const char *device, const char *service, uint16_t localPort, const char *sharedKey = nullptr);
+
+    /** The local port of a link, or 0 when there is none to that device (and service, if given). */
+    uint16_t linkPort(const char *device, const char *service = nullptr);
+
+#if defined(ARDUINO)
+    /**
+     * An HTTP request to a linked device: get("cabin", "/state", answer). Returns the HTTP status
+     * and puts the body into \`response\`; -1 when the other device could not be reached in time
+     * (lastError() then names the reason once the library knows it). It waits for the answer, at
+     * most \`timeoutMs\`; opening the session the first time takes a few seconds of that.
+     */
+    int get(const char *device, const char *path, String &response, uint32_t timeoutMs = 15000);
+
+    /** As get(), sending \`body\` (JSON unless \`contentType\` says otherwise). */
+    int post(const char *device, const char *path, const String &body, String &response, uint32_t timeoutMs = 15000, const char *contentType = "application/json");
+#endif
+
     /** Peer-to-peer connections are tried first and the relay is the fallback. false: always use the relay. */
     void setPeerToPeer(bool enabled);
 
@@ -71,6 +107,9 @@ public:
     /** How many apps are connected right now. */
     int sessions();
 
+    /** How many sessions this device has open to other devices right now. */
+    int links();
+
     /** The last error code, or an empty string. */
     const char *lastError();
 
@@ -81,6 +120,10 @@ private:
     cz_status _status = {};
     int _keys = 0;
     int _services = 0;
+    int _links = 0;
+#if defined(ARDUINO)
+    int request(const char *method, const char *device, const char *path, const String *body, const char *contentType, String &response, uint32_t timeoutMs);
+#endif
 };
 
 extern ConnectivitizerClass Connectivitizer;

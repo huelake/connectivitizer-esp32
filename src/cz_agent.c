@@ -2,6 +2,10 @@
  * The device: one loop that keeps the connection to the platform, answers connection offers and
  * serves sessions. Everything runs on one task and nothing blocks except connecting.
  *
+ * A session has an initiator and a device (protocol section 4). This file is both: the device of
+ * the sessions applications open to it, and the initiator of the sessions it opens itself for its
+ * links. A link is a local port; what connects to it becomes a stream to a service of another device.
+ *
  * Memory: an idle agent holds two buffers of 4 KB. Each session adds about 10 KB while it lasts,
  * plus its path (a TLS connection to the relay, or the KCP windows of a direct path).
  */
@@ -33,6 +37,9 @@
 #define MAX_CANDIDATES 16
 #define MAX_IPV6_ADDRESSES 3 /* lwIP keeps three per interface */
 #define MAX_LEARNED 4
+/* Lists of addresses in a log line; a list that does not fit ends in "...". */
+#define LOG_LIST_SIZE 216
+#define LOG_TARGETS_SIZE 152
 
 #define PING_INTERVAL_MS 25000
 #define SILENCE_LIMIT_MS 70000
@@ -46,22 +53,34 @@
 #define IDLE_TIMEOUT_MS 45000
 #define LEASE_GRACE_SECONDS 30
 #define KEY_REFRESH_MS 30000
+#define ANSWER_TIMEOUT_MS 15000  /* initiator: for the platform's and the device's answer to a request */
+#define DIRECT_BUDGET_MS 3000    /* initiator: how long a direct path is looked for before the relay is used */
+#define LEARNED_GRACE_MS 500     /* initiator: an announced address may still answer before a learned one is selected */
+#define LINK_IDLE_MS 30000       /* a session of a link without connections ends after this time */
+#define LINK_PENDING 4           /* connections to a link's port that wait for its session */
+#define LEASE_RETRY_SECONDS 5
+
+/* Sessions opened to this device, and one per link. */
+#define SESSION_SLOTS (CZ_MAX_SESSIONS + CZ_MAX_LINKS)
 
 enum { MUX_DATA = 0, MUX_WINDOW_UPDATE = 1, MUX_PING = 2, MUX_GO_AWAY = 3 };
 enum { FLAG_SYN = 1, FLAG_ACK = 2, FLAG_FIN = 4, FLAG_RST = 8 };
 enum { DGRAM_PROBE = 0xC1, DGRAM_PROBE_ACK = 0xC2, DGRAM_KCP = 0xC3, DGRAM_KEEP_ALIVE = 0xC4, DGRAM_CLOSE = 0xC5 };
 
 typedef enum {
+    PHASE_REQUEST,   /* initiator: waiting for the platform's grant */
+    PHASE_ANSWER,    /* initiator: waiting for the device's answer */
     PHASE_GATHER,    /* direct: asking the STUN servers */
-    PHASE_PUNCH,     /* direct: probing, waiting for the initiator to select a path or to fall back */
-    PHASE_PAIRING,   /* relay: waiting for the initiator to arrive */
-    PHASE_HANDSHAKE, /* waiting for the initiator's handshake message */
+    PHASE_PUNCH,     /* direct: probing; the initiator selects a path or falls back to the relay */
+    PHASE_PAIRING,   /* relay: waiting for the other end to arrive */
+    PHASE_HANDSHAKE, /* the end-to-end handshake: the initiator sends the first message */
     PHASE_BIND,      /* encrypted; waiting for the session bind */
     PHASE_OPEN       /* established */
 } cz_phase;
 
 typedef struct {
     bool used;
+    bool local;       /* opened by this side, as the initiator of the session */
     bool open;        /* the service was opened and the stream carries its bytes */
     bool refused;     /* the service was refused; what else arrives is dropped */
     bool acknowledged;
@@ -91,7 +110,7 @@ typedef struct {
     cz_endpoint remote[MAX_CANDIDATES];
     int remote_count;
     bool remote_known;
-    /* Addresses of the initiator it did not announce, learned from where its probes came from. */
+    /* Addresses of the peer it did not announce, learned from where its probes came from. */
     cz_endpoint learned[MAX_LEARNED];
     int learned_count;
     char local_hash[65];
@@ -116,10 +135,40 @@ typedef struct {
     int in_used;
     int in_offset;
     bool peer_closed;
-    /* For the log line when no direct path was found: what arrived, and from where. */
+    /* For the log lines of the attempt: what was sent, what arrived, and from where. */
+    int probes_sent;
+    int probes_failed; /* probes the system refused to send */
     int probes_received;
+    int answers_received;
+    bool probe_logged;
+    bool answer_logged;
     cz_endpoint unannounced;
+    /* What the initiator needs to select a path, and to say why there was none. */
+    cz_endpoint validated;         /* an announced address that answered a probe */
+    cz_endpoint validated_learned; /* a learned address that answered a probe */
+    uint32_t learned_at;
+    bool choosing;                 /* an address is being selected: the probes go to it alone */
+    cz_endpoint choice;
+    bool stun_answered;
+    bool stun_symmetric;
+    char remote_nat[12];
 } cz_direct;
+
+struct cz_session;
+
+/* A service of another device on a local port of this one. */
+typedef struct {
+    char device[CZ_NAME_SIZE];
+    char service[CZ_NAME_SIZE];
+    uint16_t port;
+    uint8_t key[CZ_KEY_SIZE];
+    int listen_fd;
+    bool listen_failed;
+    int pending[LINK_PENDING]; /* accepted connections that wait for the session, or -1 */
+    struct cz_session *session;
+    uint32_t idle_since;
+    bool idle;
+} cz_link_entry;
 
 typedef struct cz_session {
     cz_agent *agent;
@@ -128,7 +177,17 @@ typedef struct cz_session {
     char *token;
     char grant_hash[65];
     char peer_name[CZ_NAME_SIZE];
-    bool peer_direct; /* the initiator can do UDP */
+    bool initiator;       /* this side asked for the session, for a link */
+    bool direct_wanted;   /* initiator: the grant and both ends allow a direct path */
+    cz_link_entry *link;  /* initiator: the link the session belongs to */
+    uint32_t request_id;  /* initiator: the connect.request that is waiting for its grant */
+    uint32_t lease_request_id;
+    uint32_t lease_asked_at;
+    int64_t lease_renew_at;
+    uint32_t next_stream; /* initiator: the number of the next stream it opens */
+    cz_noise_handshake *handshake; /* initiator: between its handshake message and the answer */
+    char direct_failure[28];       /* initiator: why the session is not direct, or empty */
+    bool peer_direct; /* the peer can do UDP */
     bool direct;      /* the session runs (or tries to run) on a direct path */
     bool established;
     uint32_t phase_started;
@@ -211,7 +270,14 @@ struct cz_agent {
     bool message_overflow;
     char scratch[BUFFER_SIZE]; /* whatever is being built or decoded right now */
 
-    cz_session *sessions[CZ_MAX_SESSIONS];
+    cz_link_entry links[CZ_MAX_LINKS];
+    int link_count;
+    /* A device's answer that arrived before the grant of the request it belongs to. */
+    char early_answer[CZ_ID_SIZE];
+    bool early_accept;
+    char early_error[40];
+
+    cz_session *sessions[SESSION_SLOTS];
 };
 
 /* ---- Small helpers ------------------------------------------------------------------------ */
@@ -372,9 +438,16 @@ static void report_session(cz_session *session, const char *state, const char *e
     size_t capacity;
     char *json = signal_buffer(agent, &capacity);
     int length;
+    if (session->grant.session_id[0] == '\0') {
+        return; /* a request the platform never granted: there is no session to report on */
+    }
     if (strcmp(state, "established") == 0) {
-        length = snprintf(json, capacity, "{\"t\":\"session.update\",\"d\":{\"sid\":\"%s\",\"state\":\"established\",\"mode\":\"%s\",\"trust\":\"shared-key\",\"transport\":\"%s\"}}",
+        length = snprintf(json, capacity, "{\"t\":\"session.update\",\"d\":{\"sid\":\"%s\",\"state\":\"established\",\"mode\":\"%s\",\"trust\":\"shared-key\",\"transport\":\"%s\"",
                           session->grant.session_id, session->direct ? "direct" : "e2e-relay", session->direct ? "udp-kcp" : "relay-ws");
+        if (session->direct_failure[0] != '\0') {
+            length += snprintf(json + length, capacity - (size_t)length, ",\"directFailureReason\":\"%s\"", session->direct_failure);
+        }
+        length += snprintf(json + length, capacity - (size_t)length, "}}");
     } else {
         length = snprintf(json, capacity, "{\"t\":\"session.update\",\"d\":{\"sid\":\"%s\",\"state\":\"%s\",\"error\":\"%s\",\"bytesSent\":%llu,\"bytesReceived\":%llu}}",
                           session->grant.session_id, state, error, (unsigned long long)session->bytes_sent, (unsigned long long)session->bytes_received);
@@ -384,7 +457,8 @@ static void report_session(cz_session *session, const char *state, const char *e
 
 /* ---- Direct path: datagrams, STUN, KCP (protocol section 6) -------------------------------- */
 
-static void udp_send(cz_direct *d, const uint8_t *data, size_t size, cz_endpoint to)
+/* False when the system did not take the datagram. */
+static bool udp_send(cz_direct *d, const uint8_t *data, size_t size, cz_endpoint to)
 {
 #if defined(CZ_IPV6)
     if (d->ipv6) {
@@ -401,19 +475,18 @@ static void udp_send(cz_direct *d, const uint8_t *data, size_t size, cz_endpoint
             bytes[11] = 0xFF;
             memcpy(bytes + 12, &to.address, 4);
         }
-        sendto(d->fd, (const char *)data, (int)size, 0, (struct sockaddr *)&address, sizeof address);
-        return;
+        return sendto(d->fd, (const char *)data, (int)size, 0, (struct sockaddr *)&address, sizeof address) >= 0;
     }
 #endif
     if (to.ipv6) {
-        return; /* an IPv6 candidate this socket cannot reach */
+        return false; /* an IPv6 candidate this socket cannot reach */
     }
     struct sockaddr_in address;
     memset(&address, 0, sizeof address);
     address.sin_family = AF_INET;
     address.sin_port = htons(to.port);
     address.sin_addr.s_addr = to.address;
-    sendto(d->fd, (const char *)data, (int)size, 0, (struct sockaddr *)&address, sizeof address);
+    return sendto(d->fd, (const char *)data, (int)size, 0, (struct sockaddr *)&address, sizeof address) >= 0;
 }
 
 /* The sender of a received datagram; an IPv4-mapped address as the IPv4 address it stands for. */
@@ -599,45 +672,117 @@ static void direct_learn(cz_direct *d, cz_endpoint from)
     d->learned[d->learned_count++] = from;
 }
 
+/* Milliseconds since the attempt began. */
+static unsigned direct_elapsed(const cz_direct *d)
+{
+    return (unsigned)(cz_millis() - d->started);
+}
+
+/* Adds an item to a comma-separated list in `list`; once the list is full it ends in "..." instead. */
+static void list_append(char *list, size_t capacity, const char *item)
+{
+    size_t used = strlen(list);
+    size_t separator = used > 0 ? 2 : 0;
+    if (used + separator + strlen(item) + 6 <= capacity) {
+        snprintf(list + used, capacity - used, "%s%s", separator > 0 ? ", " : "", item);
+    } else if (used + 6 <= capacity && (used < 3 || strcmp(list + used - 3, "...") != 0)) {
+        snprintf(list + used, capacity - used, "%s...", separator > 0 ? ", " : "");
+    }
+}
+
+static void direct_log_first(cz_session *session, const char *what, cz_endpoint from)
+{
+    const cz_direct *d = session->d;
+    char text[64];
+    format_endpoint(from, text, sizeof text);
+    agent_log(session->agent, "session %s: direct: first %s from %s (%s) after %u ms", session->grant.session_id, what, text,
+              direct_is_candidate(d, from) ? "announced" : direct_is_learned(d, from) ? "learned" : "not announced", direct_elapsed(d));
+}
+
 static void session_set_phase(cz_session *session, cz_phase phase)
 {
     session->phase = phase;
     session->phase_started = cz_millis();
 }
 
+/* The reliable stream over the chosen address. False when there is no memory for it. */
+static bool direct_start_kcp(cz_session *session, cz_endpoint peer)
+{
+    cz_direct *d = session->d;
+    d->kcp = ikcp_create(d->conversation, d);
+    if (d->kcp == NULL) {
+        return false;
+    }
+    ikcp_setoutput(d->kcp, kcp_output);
+    d->kcp->stream = 1;
+    ikcp_setmtu(d->kcp, DATAGRAM_SIZE - 1);
+    ikcp_nodelay(d->kcp, 1, 10, 2, 1);
+    ikcp_wndsize(d->kcp, CZ_KCP_WINDOW, 128);
+    /* A smaller receive window than the reference allows by its setter: fine in stream mode,
+       and what bounds the memory of this side. The peer never sends more than it is told. */
+    d->kcp->rcv_wnd = CZ_KCP_WINDOW;
+    d->selected = true;
+    d->peer = peer;
+    d->last_received = d->last_sent = cz_millis();
+    return true;
+}
+
 /* A probe carries no payload and proves nothing: it only finds a path that works. */
 static void direct_probe_input(cz_session *session, const uint8_t *data, int size, cz_endpoint from)
 {
     cz_direct *d = session->d;
-    if (size != 18 || !cz_equal(data + 1, d->tag, 8) || data[0] != DGRAM_PROBE) {
-        return; /* not for this session, or an acknowledgement, which only the initiator uses */
+    if (size != 18 || !cz_equal(data + 1, d->tag, 8)) {
+        return; /* not for this session */
+    }
+    if (data[0] != DGRAM_PROBE) {
+        /* An acknowledgement of one of this side's probes: only the initiator acts on those. */
+        d->answers_received++;
+        if (!d->answer_logged) {
+            d->answer_logged = true;
+            direct_log_first(session, "answer", from);
+        }
+        bool announced = direct_is_candidate(d, from);
+        if (!session->initiator || d->selected || !(announced || direct_is_learned(d, from))) {
+            return;
+        }
+        if (data[9] == 0) {
+            /* The address works. A learned one is the fallback: an announced one is preferred (see direct_tick). */
+            if (announced && !endpoint_set(d->validated)) {
+                d->validated = from;
+            } else if (!announced && !endpoint_set(d->validated_learned)) {
+                d->validated_learned = from;
+                d->learned_at = cz_millis();
+            }
+        } else if (d->choosing && same_endpoint(d->choice, from) && direct_start_kcp(session, from)) {
+            /* The device acknowledged the selection: it listens on this path. */
+            char text[64];
+            format_endpoint(from, text, sizeof text);
+            agent_log(session->agent, "session %s: direct: path to %s after %u ms", session->grant.session_id, text, direct_elapsed(d));
+            session_set_phase(session, PHASE_HANDSHAKE);
+        }
+        return;
     }
     d->probes_received++;
     if (!direct_is_candidate(d, from)) {
         d->unannounced = from;
         direct_learn(d, from);
     }
+    if (!d->probe_logged) {
+        d->probe_logged = true;
+        direct_log_first(session, "probe", from);
+    }
     if (data[9] == 1) {
-        /* A "select": accepted from an address the initiator announced, or one learned from its probes. */
-        if (!direct_is_candidate(d, from) && !direct_is_learned(d, from)) {
+        /* A "select": only the initiator selects. Accepted from an address it announced, or one learned from its probes. */
+        if (session->initiator || (!direct_is_candidate(d, from) && !direct_is_learned(d, from))) {
             return;
         }
         if (!d->selected) {
-            d->kcp = ikcp_create(d->conversation, d);
-            if (d->kcp == NULL) {
+            if (!direct_start_kcp(session, from)) {
                 return;
             }
-            ikcp_setoutput(d->kcp, kcp_output);
-            d->kcp->stream = 1;
-            ikcp_setmtu(d->kcp, DATAGRAM_SIZE - 1);
-            ikcp_nodelay(d->kcp, 1, 10, 2, 1);
-            ikcp_wndsize(d->kcp, CZ_KCP_WINDOW, 128);
-            /* A smaller receive window than the reference allows by its setter: fine in stream mode,
-               and what bounds the memory of this side. The peer never sends more than it is told. */
-            d->kcp->rcv_wnd = CZ_KCP_WINDOW;
-            d->selected = true;
-            d->peer = from;
-            d->last_received = d->last_sent = cz_millis();
+            char text[64];
+            format_endpoint(from, text, sizeof text);
+            agent_log(session->agent, "session %s: direct: the peer selected %s after %u ms", session->grant.session_id, text, direct_elapsed(d));
             /* The path listens before the selection is acknowledged, so the initiator's first packets are not lost. */
             session_set_phase(session, PHASE_HANDSHAKE);
         } else if (!same_endpoint(d->peer, from)) {
@@ -680,6 +825,7 @@ static void direct_input(cz_session *session)
 /* ---- Session: sending --------------------------------------------------------------------- */
 
 static void session_end(cz_session *session, const char *reason, bool tell_peer);
+static void direct_log_summary(cz_session *session);
 
 /* Encrypts the `size` plaintext bytes at session->tx + TX_OFFSET and sends them as one message. */
 static bool session_send(cz_session *session, size_t size)
@@ -712,14 +858,14 @@ static bool session_send_frame(cz_session *session, int type, int flags, uint32_
     return true;
 }
 
-/* The accepting side marks the first frame it sends for a stream. */
+/* The first frame a side sends for a stream says whether it opens the stream or accepts it. */
 static int first_frame_flags(cz_stream *stream)
 {
     if (stream->acknowledged) {
         return 0;
     }
     stream->acknowledged = true;
-    return FLAG_ACK;
+    return stream->local ? FLAG_SYN : FLAG_ACK;
 }
 
 /* Sends `size` bytes that were written to session_payload() as data on a stream. */
@@ -791,10 +937,25 @@ static void session_free(cz_session *session)
             cz_socket_close(session->streams[i].fd);
         }
     }
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] == session) {
             agent->sessions[i] = NULL;
         }
+    }
+    if (session->link != NULL && session->link->session == session) {
+        /* Connections that waited for this session get nothing: they are closed, and the next one asks again. */
+        session->link->session = NULL;
+        session->link->idle = false;
+        for (int i = 0; i < LINK_PENDING; i++) {
+            if (session->link->pending[i] >= 0) {
+                cz_socket_close(session->link->pending[i]);
+                session->link->pending[i] = -1;
+            }
+        }
+    }
+    if (session->handshake != NULL) {
+        memset(session->handshake, 0, sizeof *session->handshake);
+        free(session->handshake);
     }
     memset(&session->noise, 0, sizeof session->noise);
     free(session->token);
@@ -823,8 +984,11 @@ static void session_end(cz_session *session, const char *reason, bool tell_peer)
         session_send(session, MUX_HEADER);
     }
     session_close_path(session, true);
-    agent_log(agent, "session %s with %s %s (%s)", session->grant.session_id, session->peer_name, session->established ? "ended" : "failed", reason);
-    report_session(session, session->established ? "ended" : "failed", reason);
+    if (session->grant.session_id[0] != '\0') {
+        /* A request the platform refused has no session to speak of; the caller has logged the refusal. */
+        agent_log(agent, "session %s with %s %s (%s)", session->grant.session_id, session->peer_name, session->established ? "ended" : "failed", reason);
+        report_session(session, session->established ? "ended" : "failed", reason);
+    }
     cz_copy(agent->last_error, sizeof agent->last_error, strcmp(reason, "SESSION_CLOSED") == 0 ? "" : reason);
 }
 
@@ -909,7 +1073,8 @@ static void control_message(cz_session *session, cz_span message)
         text_member(bind, "mode", mode, sizeof mode);
         text_member(bind, "cands", candidates, sizeof candidates);
         /* Both ends must agree on the session, the grant and the route each of them observed itself. */
-        bool agrees = strcmp(text, session->grant.session_id) == 0 && strcmp(hash, session->grant_hash) == 0 && strcmp(role, "initiator") == 0
+        bool agrees = strcmp(text, session->grant.session_id) == 0 && strcmp(hash, session->grant_hash) == 0
+            && strcmp(role, session->initiator ? "device" : "initiator") == 0
             && strcmp(mode, session->direct ? "direct" : "e2e-relay") == 0
             /* The addresses probed came through the control plane; here the authenticated peer confirms them. */
             && (!session->direct || (candidates[0] != '\0' && strcmp(candidates, session->d->remote_hash) == 0));
@@ -920,7 +1085,18 @@ static void control_message(cz_session *session, cz_span message)
         session->bound = true;
         session->established = true;
         session_set_phase(session, PHASE_OPEN);
-        if (session->direct && session->d != NULL) {
+        if (session->initiator) {
+            /* The initiator keeps the session authorised: it asks for a new grant when half the lease is over. */
+            session->lease_renew_at = agent_now(agent) + (session->lease_expires - agent_now(agent)) / 2;
+            if (session->direct && session->d != NULL) {
+                char peer[64];
+                format_endpoint(session->d->peer, peer, sizeof peer);
+                agent_log(agent, "session %s opened to %s (direct, shared-key, device at %s, %s)", session->grant.session_id, session->peer_name, peer,
+                          direct_is_candidate(session->d, session->d->peer) ? "announced" : "learned");
+            } else {
+                agent_log(agent, "session %s opened to %s (e2e-relay, shared-key)", session->grant.session_id, session->peer_name);
+            }
+        } else if (session->direct && session->d != NULL) {
             /* Where the app is: an address it announced, or one learned from its probes (protocol 6.5). */
             char peer[64];
             format_endpoint(session->d->peer, peer, sizeof peer);
@@ -933,7 +1109,7 @@ static void control_message(cz_session *session, cz_span message)
         return;
     }
 
-    if (session->bound && cz_json_member(message, "lease", &value)) {
+    if (session->bound && !session->initiator && cz_json_member(message, "lease", &value)) {
         /* The token is copied out first: verifying needs the scratch buffer it would otherwise share. */
         cz_span token_value;
         char *token = (char *)malloc(CONTROL_SIZE);
@@ -1001,8 +1177,43 @@ static int stream_input(cz_session *session, cz_stream *stream, const uint8_t *d
         return control_input(session, data, size);
     }
 
+    /* On a stream this side opened, first comes the device's answer: {"ok":true}, or {"ok":false,"error":"<code>"}. */
+    while (stream->local && !stream->open && taken < size) {
+        if (stream->preamble_used >= (int)sizeof stream->preamble) {
+            stream_reset(session, stream);
+            return size;
+        }
+        stream->preamble[stream->preamble_used++] = data[taken++];
+        if (stream->preamble_used >= 2) {
+            int length = (stream->preamble[0] << 8) | stream->preamble[1];
+            if (length == 0 || length > (int)sizeof stream->preamble - 2) {
+                stream_reset(session, stream);
+                return size;
+            }
+            if (stream->preamble_used == 2 + length) {
+                cz_span answer = { (const char *)stream->preamble + 2, (size_t)length };
+                cz_span value;
+                bool ok = false;
+                if (!cz_json_member(answer, "ok", &value) || !cz_json_bool(value, &ok) || !ok) {
+                    char code[40] = "SESSION_CLOSED";
+                    text_member(answer, "error", code, sizeof code);
+                    agent_log(session->agent, "session %s: %s did not open service '%s' (%s)", session->grant.session_id, session->peer_name,
+                              session->link != NULL ? session->link->service : "", code);
+                    cz_copy(session->agent->last_error, sizeof session->agent->last_error, code);
+                    stream_reset(session, stream);
+                    return size;
+                }
+                stream->open = true;
+                stream_consumed(session, stream, (uint32_t)stream->preamble_used);
+            }
+        }
+    }
+    if (stream->local && taken == size) {
+        return size;
+    }
+
     /* First comes the name of the service the initiator wants: {"svc":"<name>"} with a 2-byte length. */
-    while (!stream->open && !stream->refused && taken < size) {
+    while (!stream->local && !stream->open && !stream->refused && taken < size) {
         if (stream->preamble_used >= (int)sizeof stream->preamble) {
             stream_reset(session, stream);
             return size;
@@ -1135,7 +1346,7 @@ static bool mux_consume(cz_session *session)
     cz_stream *stream = session_find_stream(session, id);
     if (flags & FLAG_SYN) {
         /* Only the initiator opens streams, with odd and increasing numbers. */
-        if (stream != NULL || id % 2 == 0 || id <= session->last_remote_stream) {
+        if (session->initiator || stream != NULL || id % 2 == 0 || id <= session->last_remote_stream) {
             session_end(session, "MUX_PROTOCOL_ERROR", false);
             return true;
         }
@@ -1272,6 +1483,89 @@ static void session_pump(cz_session *session)
         }
     }
 
+    if (session->phase == PHASE_HANDSHAKE && session->initiator) {
+        char prologue[160];
+        int prologue_size = snprintf(prologue, sizeof prologue, "cz-e2e-shared-key/1|%s|%s", session->grant.session_id, session->grant_hash);
+        if (session->handshake == NULL) {
+            /* This side begins: 32 bytes of key agreement and a 16-byte tag, behind a 2-byte length. */
+            session->handshake = (cz_noise_handshake *)malloc(sizeof *session->handshake);
+            if (session->handshake == NULL) {
+                session_end(session, "E2E_HANDSHAKE_FAILED", false);
+                return;
+            }
+            uint8_t *first = session->tx + TX_OFFSET;
+            uint8_t ephemeral[CZ_KEY_SIZE];
+            cz_random(ephemeral, sizeof ephemeral);
+            cz_noise_initiate(session->handshake, (const uint8_t *)prologue, (size_t)prologue_size, session->link->key, ephemeral, NULL, 0, first);
+            memset(ephemeral, 0, sizeof ephemeral);
+            first[-2] = (uint8_t)(CZ_HANDSHAKE_SIZE >> 8);
+            first[-1] = (uint8_t)CZ_HANDSHAKE_SIZE;
+            bool sent = session->direct ? ikcp_send(session->d->kcp, (const char *)first - 2, CZ_HANDSHAKE_SIZE + 2) >= 0
+                                        : cz_ws_send(&session->relay, false, first - 2, CZ_HANDSHAKE_SIZE + 2);
+            if (!sent) {
+                session_end(session, "E2E_HANDSHAKE_FAILED", false);
+                return;
+            }
+            session->rx_used = 0;
+        }
+        /* The device's answer has the same form. An empty one says that it holds no key that fits. */
+        while (session->rx_used < 2 || session->rx_used < 2 + ((session->rx[0] << 8) | session->rx[1])) {
+            int wanted = session->rx_used < 2 ? 2 - session->rx_used : 2 + ((session->rx[0] << 8) | session->rx[1]) - session->rx_used;
+            int size = path_read(session, session->rx + session->rx_used, wanted, &reason);
+            if (size < 0) {
+                session_end(session, strcmp(reason, "PATH_CLOSED") == 0 ? "E2E_HANDSHAKE_FAILED" : reason, false);
+                return;
+            }
+            if (size == 0) {
+                return;
+            }
+            session->rx_used += size;
+            if (session->rx_used >= 2) {
+                int length = (session->rx[0] << 8) | session->rx[1];
+                if (length == 0) {
+                    session_end(session, "E2E_SHARED_KEY_MISMATCH", false);
+                    return;
+                }
+                if (length != CZ_HANDSHAKE_SIZE) {
+                    session_end(session, "E2E_HANDSHAKE_FAILED", false);
+                    return;
+                }
+            }
+        }
+        session->rx_used = 0;
+        uint8_t no_payload[64];
+        bool ready = cz_noise_initiate_finish(session->handshake, session->rx + 2, CZ_HANDSHAKE_SIZE, no_payload, &session->noise);
+        memset(session->handshake, 0, sizeof *session->handshake);
+        free(session->handshake);
+        session->handshake = NULL;
+        if (!ready) {
+            session_end(session, "E2E_SHARED_KEY_MISMATCH", false);
+            return;
+        }
+        session_set_phase(session, PHASE_BIND);
+
+        /* The first stream is the control stream: this side opens it and states its view of the session. */
+        cz_stream *control = &session->control;
+        memset(control, 0, sizeof *control);
+        control->used = true;
+        control->local = true;
+        control->id = 1;
+        control->fd = -1;
+        control->send_window = INITIAL_WINDOW;
+        session->next_stream = 3;
+        char json[320];
+        if (session->direct) {
+            snprintf(json, sizeof json, "{\"bind\":{\"sid\":\"%s\",\"grant\":\"%s\",\"role\":\"initiator\",\"mode\":\"direct\",\"cands\":\"%s\"}}",
+                     session->grant.session_id, session->grant_hash, session->d->local_hash);
+        } else {
+            snprintf(json, sizeof json, "{\"bind\":{\"sid\":\"%s\",\"grant\":\"%s\",\"role\":\"initiator\",\"mode\":\"e2e-relay\"}}",
+                     session->grant.session_id, session->grant_hash);
+        }
+        if (!stream_send_json(session, control, 4, json)) {
+            return;
+        }
+    }
+
     if (session->phase == PHASE_HANDSHAKE) {
         /* The initiator's handshake message: 32 bytes of key agreement and a 16-byte tag, behind a 2-byte length. */
         while (session->rx_used < 2 + CZ_HANDSHAKE_SIZE) {
@@ -1403,7 +1697,7 @@ static void session_connect_relay(cz_session *session)
         return;
     }
     session->direct = false;
-    snprintf(agent->scratch, BUFFER_SIZE, "Authorization: Bearer %s\r\nCz-Role: device\r\n", session->token);
+    snprintf(agent->scratch, BUFFER_SIZE, "Authorization: Bearer %s\r\nCz-Role: %s\r\n", session->token, session->initiator ? "initiator" : "device");
     if (!cz_ws_open(&session->relay, session->grant.relay_url, agent->scratch, agent->root_ca, error, sizeof error)) {
         session_end(session, error, false);
         return;
@@ -1412,18 +1706,49 @@ static void session_connect_relay(cz_session *session)
     session_set_phase(session, PHASE_PAIRING);
 }
 
+/*
+ * Initiator: there is no direct path. The device is told to come to the relay, if the session may
+ * use it; a session that may only be direct ends here.
+ */
+static void session_fall_back(cz_session *session, const char *reason)
+{
+    cz_agent *agent = session->agent;
+    cz_copy(session->direct_failure, sizeof session->direct_failure, reason);
+    agent_log(agent, "session %s: no direct path (%s), using the relay", session->grant.session_id, reason);
+    if (session->d != NULL) {
+        direct_log_summary(session);
+        direct_close(session->d, false);
+        session->d = NULL;
+    }
+    session->direct = false;
+    if (!session->grant.mode_relay || session->grant.relay_url[0] == '\0') {
+        session_end(session, "DIRECT_UNAVAILABLE", false);
+        return;
+    }
+    size_t capacity;
+    char *json = signal_buffer(agent, &capacity);
+    signal_send(agent, snprintf(json, capacity, "{\"t\":\"path.fallback\",\"d\":{\"sid\":\"%s\",\"reason\":\"%s\"}}", session->grant.session_id, reason));
+    session_connect_relay(session);
+}
+
 static void session_start_direct(cz_session *session)
 {
     cz_agent *agent = session->agent;
     cz_direct *d = (cz_direct *)calloc(1, sizeof *d);
-    if (d == NULL) {
-        session_connect_relay(session);
-        return;
+    if (d != NULL) {
+        d->fd = udp_open(&d->ipv6, &d->port);
+        if (d->fd < 0) {
+            free(d);
+            d = NULL;
+        }
     }
-    d->fd = udp_open(&d->ipv6, &d->port);
-    if (d->fd < 0) {
-        free(d);
-        session_connect_relay(session);
+    if (d == NULL) {
+        /* No socket for a direct path: the device follows the initiator to the relay, the initiator says so. */
+        if (session->initiator) {
+            session_fall_back(session, "udp_blocked_local");
+        } else {
+            session_connect_relay(session);
+        }
         return;
     }
     cz_socket_set_nonblocking(d->fd);
@@ -1466,13 +1791,17 @@ static void direct_send_candidates(cz_session *session)
     cz_agent *agent = session->agent;
     cz_direct *d = session->d;
     char list[480];
-    int length = snprintf(list, sizeof list, "{\"sid\":\"%s\",\"role\":\"device\",\"udp\":[", session->grant.session_id);
+    int length = snprintf(list, sizeof list, "{\"sid\":\"%s\",\"role\":\"%s\",\"udp\":[", session->grant.session_id, session->initiator ? "initiator" : "device");
     int count = 0;
     char text[64];
+    /* The same addresses as plain text for the log; the scratch buffer is free until the message is built. */
+    char *announced = agent->scratch;
+    announced[0] = '\0';
 
     cz_endpoint own = endpoint_v4(cz_local_address(), d->port);
     if (own.address != 0) {
         format_endpoint(own, text, sizeof text);
+        list_append(announced, LOG_LIST_SIZE, text);
         length += snprintf(list + length, sizeof list - (size_t)length, "%s\"%s\"", count++ > 0 ? "," : "", text);
     }
     if (d->ipv6) {
@@ -1486,11 +1815,14 @@ static void direct_send_candidates(cz_session *session)
             memcpy(global.v6, addresses[i], 16);
             global.port = d->port;
             format_endpoint(global, text, sizeof text);
+            list_append(announced, LOG_LIST_SIZE, text);
             length += snprintf(list + length, sizeof list - (size_t)length, "%s\"%s\"", count++ > 0 ? "," : "", text);
         }
     }
     if (agent->include_loopback) {
-        length += snprintf(list + length, sizeof list - (size_t)length, "%s\"127.0.0.1:%u\"", count++ > 0 ? "," : "", (unsigned)d->port);
+        snprintf(text, sizeof text, "127.0.0.1:%u", (unsigned)d->port);
+        list_append(announced, LOG_LIST_SIZE, text);
+        length += snprintf(list + length, sizeof list - (size_t)length, "%s\"%s\"", count++ > 0 ? "," : "", text);
     }
     bool answered = false;
     bool symmetric = false;
@@ -1505,14 +1837,25 @@ static void direct_send_candidates(cz_session *session)
             answered = true;
         }
     }
-    if (answered && !same_endpoint(mapped, own) && !(agent->include_loopback && mapped.port == d->port && mapped.address == htonl(0x7f000001u))) {
+    d->stun_answered = answered;
+    d->stun_symmetric = symmetric;
+    if (answered) {
         format_endpoint(mapped, text, sizeof text);
+        agent_log(agent, "session %s: direct: UDP socket on port %u, IPv6 %s; STUN: %s (%s)", session->grant.session_id, (unsigned)d->port,
+                  d->ipv6 ? "yes" : "no", text, symmetric ? "symmetric NAT" : "cone");
+    } else {
+        agent_log(agent, "session %s: direct: UDP socket on port %u, IPv6 %s; STUN: no answer", session->grant.session_id, (unsigned)d->port,
+                  d->ipv6 ? "yes" : "no");
+    }
+    if (answered && !same_endpoint(mapped, own) && !(agent->include_loopback && mapped.port == d->port && mapped.address == htonl(0x7f000001u))) {
+        list_append(announced, LOG_LIST_SIZE, text);
         length += snprintf(list + length, sizeof list - (size_t)length, "%s\"%s\"", count++ > 0 ? "," : "", text);
     }
     length += snprintf(list + length, sizeof list - (size_t)length, "],\"nat\":\"%s\"}", !answered ? "unknown" : symmetric ? "symmetric" : "cone");
 
     const char *offered = strstr(list, "\"udp\"");
     agent_log(agent, "session %s: offering %s", session->grant.session_id, offered != NULL ? offered : list);
+    agent_log(agent, "session %s: direct: announcing %s", session->grant.session_id, announced[0] != '\0' ? announced : "(none)");
 
     uint8_t digest[CZ_SHA256_SIZE];
     cz_sha256(list, (size_t)length, digest);
@@ -1544,28 +1887,64 @@ static void direct_set_remote(cz_session *session, cz_span blob_value)
     }
     agent->scratch[length] = '\0';
     const char *offered = strstr(agent->scratch, "\"udp\"");
-    agent_log(agent, "session %s: the app offers %s", session->grant.session_id, offered != NULL ? offered : agent->scratch);
+    agent_log(agent, "session %s: the %s offers %s", session->grant.session_id, session->initiator ? "device" : "app", offered != NULL ? offered : agent->scratch);
     cz_span list = { agent->scratch, (size_t)length };
     cz_span value;
     char text[CZ_ID_SIZE];
     if (!text_member(list, "sid", text, sizeof text) || strcmp(text, session->grant.session_id) != 0
-        || !text_member(list, "role", text, sizeof text) || strcmp(text, "initiator") != 0 || !cz_json_member(list, "udp", &value)) {
+        || !text_member(list, "role", text, sizeof text) || strcmp(text, session->initiator ? "device" : "initiator") != 0 || !cz_json_member(list, "udp", &value)) {
         return;
     }
     size_t cursor = 0;
     cz_span item;
     char candidate[64];
+    /* The decoded list is in the scratch buffer; the buffer of the encoded one collects the addresses for the log. */
+    char *announced = encoded;
+    announced[0] = '\0';
     while (d->remote_count < MAX_CANDIDATES && cz_json_next(value, &cursor, &item)) {
         cz_endpoint endpoint;
-        if (cz_json_string(item, candidate, sizeof candidate) && parse_endpoint(candidate, &endpoint) && (d->ipv6 || !endpoint.ipv6)
-            && !direct_is_candidate(d, endpoint)) {
+        if (!cz_json_string(item, candidate, sizeof candidate)) {
+            continue;
+        }
+        list_append(announced, LOG_LIST_SIZE, candidate);
+        if (parse_endpoint(candidate, &endpoint) && (d->ipv6 || !endpoint.ipv6) && !direct_is_candidate(d, endpoint)) {
             d->remote[d->remote_count++] = endpoint;
         }
     }
+    if (!text_member(list, "nat", text, sizeof text)) {
+        cz_copy(text, sizeof text, "unknown");
+    }
+    cz_copy(d->remote_nat, sizeof d->remote_nat, text);
+    agent_log(agent, "session %s: direct: peer announces %s; NAT %s; after %u ms", session->grant.session_id,
+              announced[0] != '\0' ? announced : "(none)", text, direct_elapsed(d));
     uint8_t digest[CZ_SHA256_SIZE];
     cz_sha256(agent->scratch, (size_t)length, digest);
     cz_hex(digest, sizeof digest, d->remote_hash);
     d->remote_known = true;
+}
+
+/* What this side of the attempt sent and saw, for the log when no path was found. Uses the scratch buffer. */
+static void direct_log_summary(cz_session *session)
+{
+    cz_agent *agent = session->agent;
+    const cz_direct *d = session->d;
+    char *targets = agent->scratch;
+    char text[64];
+    char failures[48] = "";
+    targets[0] = '\0';
+    for (int i = 0; i < d->learned_count; i++) {
+        format_endpoint(d->learned[i], text, sizeof text);
+        list_append(targets, LOG_TARGETS_SIZE, text);
+    }
+    for (int i = 0; i < d->remote_count; i++) {
+        format_endpoint(d->remote[i], text, sizeof text);
+        list_append(targets, LOG_TARGETS_SIZE, text);
+    }
+    if (d->probes_failed > 0) {
+        snprintf(failures, sizeof failures, " (%d not sent by the system)", d->probes_failed);
+    }
+    agent_log(agent, "session %s: direct: after %u ms: sent %d probes%s to %s; received %d probes and %d answers", session->grant.session_id,
+              direct_elapsed(d), d->probes_sent, failures, targets[0] != '\0' ? targets : "(none)", d->probes_received, d->answers_received);
 }
 
 /* What is due on a direct path: STUN retries, probes, KCP's timer, keep-alives, time-outs. */
@@ -1586,22 +1965,52 @@ static void direct_tick(cz_session *session)
     }
 
     if (!d->selected) {
-        /* Probing the initiator's addresses opens this side's NAT for them. */
+        if (session->initiator && !d->choosing) {
+            /* An address answered: it is selected. A learned one only once an announced one has had a moment to answer too. */
+            if (endpoint_set(d->validated)) {
+                d->choice = d->validated;
+                d->choosing = true;
+            } else if (endpoint_set(d->validated_learned) && elapsed(d->learned_at, LEARNED_GRACE_MS)) {
+                d->choice = d->validated_learned;
+                d->choosing = true;
+            }
+            if (d->choosing) {
+                char text[64];
+                format_endpoint(d->choice, text, sizeof text);
+                agent_log(session->agent, "session %s: direct: %s answered after %u ms (%s); selecting it", session->grant.session_id, text,
+                          direct_elapsed(d), direct_is_candidate(d, d->choice) ? "announced" : "learned");
+                d->last_probe = cz_millis() - PROBE_INTERVAL_MS;
+            }
+        }
+        /* Probing the peer's addresses opens this side's NAT for them. */
         if (d->remote_known && elapsed(d->last_probe, PROBE_INTERVAL_MS)) {
             uint8_t probe[18];
             probe[0] = DGRAM_PROBE;
             memcpy(probe + 1, d->tag, 8);
-            probe[9] = 0;
+            probe[9] = d->choosing ? 1 : 0;
             cz_random(probe + 10, 8);
-            for (int i = 0; i < d->learned_count; i++) {
-                udp_send(d, probe, sizeof probe, d->learned[i]);
+            if (d->choosing) {
+                udp_send(d, probe, sizeof probe, d->choice);
             }
-            for (int i = 0; i < d->remote_count; i++) {
-                udp_send(d, probe, sizeof probe, d->remote[i]);
+            for (int i = 0; i < d->learned_count && !d->choosing; i++) {
+                d->probes_sent++;
+                d->probes_failed += udp_send(d, probe, sizeof probe, d->learned[i]) ? 0 : 1;
+            }
+            for (int i = 0; i < d->remote_count && !d->choosing; i++) {
+                d->probes_sent++;
+                d->probes_failed += udp_send(d, probe, sizeof probe, d->remote[i]) ? 0 : 1;
             }
             d->last_probe = cz_millis();
         }
-        if (elapsed(session->phase_started, DIRECT_TIMEOUT_MS)) {
+        if (session->initiator) {
+            if (elapsed(session->phase_started, DIRECT_BUDGET_MS)) {
+                session_fall_back(session, d->stun_symmetric && strcmp(d->remote_nat, "symmetric") == 0 ? "symmetric_nat_both"
+                                               : !d->stun_answered ? (d->stun_count > 0 ? "udp_blocked_local" : "stun_unreachable")
+                                               : !d->remote_known || strcmp(d->remote_nat, "unknown") == 0 ? "udp_blocked_remote"
+                                               : "probe_timeout");
+            }
+        } else if (elapsed(session->phase_started, DIRECT_TIMEOUT_MS)) {
+            direct_log_summary(session);
             session_end(session, "SIGNALING_TIMEOUT", false);
         }
         return;
@@ -1640,42 +2049,42 @@ static void send_answer(cz_agent *agent, const char *session_id, const char *ref
 }
 
 /*
- * The platform says an application wants to connect. The device checks the grant's signature and
- * that the grant is really about this device. Whether the application is to be trusted is not
- * the platform's to say: the handshake proves that it holds the shared key.
+ * What an offer and the answer to a request have in common: the session, the other end and the
+ * grant. Everything is copied out, because the buffer the message is in gets reused. Returns the
+ * grant token, which the caller frees, or NULL when the message is not usable.
  */
-static void handle_offer(cz_agent *agent, cz_span data)
+static char *read_grant_message(cz_span data, char *session_id, size_t id_capacity, char *peer_name, size_t name_capacity, bool *peer_direct)
 {
-    char session_id[CZ_ID_SIZE] = "";
-    char peer_name[CZ_NAME_SIZE] = "";
     cz_span value;
     cz_span peer;
-    bool peer_direct = false;
-    size_t token_length = 0;
     char *token = NULL;
-
-    /* Everything needed is copied out first: the buffer the offer is in gets reused below. */
-    text_member(data, "sid", session_id, sizeof session_id);
+    session_id[0] = '\0';
+    peer_name[0] = '\0';
+    *peer_direct = false;
+    text_member(data, "sid", session_id, id_capacity);
     if (cz_json_member(data, "peer", &peer)) {
-        if (!text_member(peer, "name", peer_name, sizeof peer_name)) {
-            text_member(peer, "id", peer_name, sizeof peer_name);
+        if (!text_member(peer, "name", peer_name, name_capacity)) {
+            text_member(peer, "id", peer_name, name_capacity);
         }
-        peer_direct = cz_json_member(peer, "caps", &value) && cz_json_contains(value, "path.udp-kcp");
+        *peer_direct = cz_json_member(peer, "caps", &value) && cz_json_contains(value, "path.udp-kcp");
     }
     if (cz_json_member(data, "grant", &value) && value.length > 2) {
-        token_length = value.length;
-        token = (char *)malloc(token_length);
-        if (token != NULL && !cz_json_string(value, token, token_length)) {
+        token = (char *)malloc(value.length);
+        if (token != NULL && !cz_json_string(value, token, value.length)) {
             free(token);
             token = NULL;
         }
     }
-    if (session_id[0] == '\0' || token == NULL) {
+    if (session_id[0] == '\0') {
         free(token);
-        return;
+        token = NULL;
     }
+    return token;
+}
 
-    /* The keys grants are signed with are fetched when a key appears that is not known yet. */
+/* The keys grants are signed with are fetched when a key appears that is not known yet. Uses the message buffer. */
+static void refresh_grant_keys(cz_agent *agent, const char *token)
+{
     char kid[24];
     if (cz_grant_key_id(token, kid, sizeof kid) && !grant_key_known(agent, kid) && (!agent->keys_fetched || elapsed(agent->keys_fetched_at, KEY_REFRESH_MS))) {
         agent->keys_fetched = true;
@@ -1684,6 +2093,45 @@ static void handle_offer(cz_agent *agent, cz_span data)
             agent->grant_key_count = cz_grant_keys_parse(agent->message, strlen(agent->message), agent->grant_keys, CZ_MAX_GRANT_KEYS);
         }
     }
+}
+
+static void session_prepare(cz_session *session, cz_agent *agent)
+{
+    session->agent = agent;
+    session->blocked_fd = -1;
+    session->control.fd = -1;
+    for (int i = 0; i < CZ_MAX_STREAMS; i++) {
+        session->streams[i].fd = -1;
+    }
+    session->phase_started = cz_millis();
+}
+
+/* Takes a verified grant's token into the session. */
+static void session_take_grant(cz_session *session, char *token, bool peer_direct)
+{
+    session->token = token;
+    session->peer_direct = peer_direct;
+    uint8_t digest[CZ_SHA256_SIZE];
+    cz_sha256(token, strlen(token), digest);
+    cz_hex(digest, sizeof digest, session->grant_hash);
+    session->lease_expires = session->grant.issued_at + session->grant.lease_seconds;
+}
+
+/*
+ * The platform says an application wants to connect. The device checks the grant's signature and
+ * that the grant is really about this device. Whether the application is to be trusted is not
+ * the platform's to say: the handshake proves that it holds the shared key.
+ */
+static void handle_offer(cz_agent *agent, cz_span data)
+{
+    char session_id[CZ_ID_SIZE];
+    char peer_name[CZ_NAME_SIZE];
+    bool peer_direct;
+    char *token = read_grant_message(data, session_id, sizeof session_id, peer_name, sizeof peer_name, &peer_direct);
+    if (token == NULL) {
+        return;
+    }
+    refresh_grant_keys(agent, token);
 
     cz_session *session = (cz_session *)calloc(1, sizeof *session);
     if (session == NULL) {
@@ -1714,39 +2162,38 @@ static void handle_offer(cz_agent *agent, cz_span data)
         return;
     }
 
-    /* A new session takes the place of the oldest when every slot is in use. */
+    /*
+     * A new session takes the place of the oldest one opened to this device when CZ_MAX_SESSIONS of
+     * them are running. The sessions this device opened itself have slots of their own.
+     */
     int slot = -1;
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    int oldest = -1;
+    int count = 0;
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] == NULL) {
             slot = i;
-        }
-    }
-    if (slot < 0) {
-        slot = 0;
-        for (int i = 1; i < CZ_MAX_SESSIONS; i++) {
-            if ((int32_t)(agent->sessions[i]->phase_started - agent->sessions[slot]->phase_started) < 0) {
-                slot = i;
+        } else if (!agent->sessions[i]->initiator) {
+            count++;
+            if (oldest < 0 || (int32_t)(agent->sessions[i]->phase_started - agent->sessions[oldest]->phase_started) < 0) {
+                oldest = i;
             }
         }
+    }
+    if ((count >= CZ_MAX_SESSIONS || slot < 0) && oldest >= 0) {
+        slot = oldest;
         session_end(agent->sessions[slot], "SESSION_CLOSED", true);
         session_free(agent->sessions[slot]);
     }
+    if (slot < 0) {
+        free(token);
+        free(session);
+        return;
+    }
     agent->sessions[slot] = session;
 
-    session->agent = agent;
-    session->token = token;
-    session->peer_direct = peer_direct;
-    session->blocked_fd = -1;
-    session->control.fd = -1;
-    for (int i = 0; i < CZ_MAX_STREAMS; i++) {
-        session->streams[i].fd = -1;
-    }
+    session_prepare(session, agent);
+    session_take_grant(session, token, peer_direct);
     cz_copy(session->peer_name, sizeof session->peer_name, peer_name);
-    uint8_t digest[CZ_SHA256_SIZE];
-    cz_sha256(token, strlen(token), digest);
-    cz_hex(digest, sizeof digest, session->grant_hash);
-    session->lease_expires = session->grant.issued_at + session->grant.lease_seconds;
-    session->phase_started = cz_millis();
 
     /* The device follows the initiator: a direct path if the initiator finds one, the relay if it says so. */
     if (direct) {
@@ -1762,12 +2209,334 @@ static cz_session *find_session(cz_agent *agent, cz_span data)
     if (!text_member(data, "sid", session_id, sizeof session_id)) {
         return NULL;
     }
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] != NULL && !agent->sessions[i]->ended && strcmp(agent->sessions[i]->grant.session_id, session_id) == 0) {
             return agent->sessions[i];
         }
     }
     return NULL;
+}
+
+/* ---- Links: the sessions this device opens (protocol section 8) ----------------------------- */
+
+static void link_drop_pending(cz_link_entry *link)
+{
+    for (int i = 0; i < LINK_PENDING; i++) {
+        if (link->pending[i] >= 0) {
+            cz_socket_close(link->pending[i]);
+            link->pending[i] = -1;
+        }
+    }
+}
+
+/* The link's port, on the loopback address only: what it leads to is for this device alone. */
+static void link_listen(cz_agent *agent, cz_link_entry *link)
+{
+    int fd = (int)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in local;
+    memset(&local, 0, sizeof local);
+    local.sin_family = AF_INET;
+    local.sin_port = htons(link->port);
+    local.sin_addr.s_addr = htonl(0x7f000001u);
+#if !defined(_WIN32)
+    int on = 1;
+    if (fd >= 0) {
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const char *)&on, sizeof on);
+    }
+#endif
+    if (fd < 0 || bind(fd, (struct sockaddr *)&local, sizeof local) != 0 || listen(fd, LINK_PENDING) != 0) {
+        cz_socket_close(fd);
+        link->listen_failed = true;
+        agent_log(agent, "link to %s: port %u on this device cannot be opened", link->device, (unsigned)link->port);
+        return;
+    }
+    cz_socket_set_nonblocking(fd);
+    link->listen_fd = fd;
+    agent_log(agent, "link to %s/%s on 127.0.0.1:%u", link->device, link->service, (unsigned)link->port);
+}
+
+/* Asks the platform for a session to the link's device. The answer is a grant, or an error. */
+static void link_start(cz_agent *agent, cz_link_entry *link)
+{
+    int slot = -1;
+    for (int i = 0; i < SESSION_SLOTS; i++) {
+        if (agent->sessions[i] == NULL) {
+            slot = i;
+        }
+    }
+    cz_session *session = slot >= 0 ? (cz_session *)calloc(1, sizeof *session) : NULL;
+    if (session == NULL) {
+        link_drop_pending(link);
+        return;
+    }
+    session_prepare(session, agent);
+    session->initiator = true;
+    session->link = link;
+    session->phase = PHASE_REQUEST;
+    session->request_id = ++agent->message_id;
+    cz_copy(session->peer_name, sizeof session->peer_name, link->device);
+    agent->sessions[slot] = session;
+    link->session = session;
+    link->idle = false;
+
+    size_t capacity;
+    char *json = signal_buffer(agent, &capacity);
+    int length = snprintf(json, capacity, "{\"t\":\"connect.request\",\"id\":\"c%u\",\"d\":{\"device\":", (unsigned)session->request_id);
+    length += cz_json_quote(json + length, capacity - (size_t)length, link->device);
+    length += snprintf(json + length, capacity - (size_t)length, ",\"services\":[");
+    length += cz_json_quote(json + length, capacity - (size_t)length, link->service);
+    length += snprintf(json + length, capacity - (size_t)length, "],\"e2e\":[\"shared-key\"]%s}}", agent->peer_to_peer ? "" : ",\"modes\":[\"e2e-relay\"]");
+    if (!signal_send(agent, length)) {
+        session_end(session, "SIGNALING_UNAVAILABLE", false);
+    }
+}
+
+/* The device answered: the path is opened, or the session is over. */
+static void link_answered(cz_session *session, bool accept, const char *error)
+{
+    if (!accept) {
+        session_end(session, error[0] != '\0' ? error : "DEVICE_REJECTED", false);
+    } else if (session->direct_wanted) {
+        session_start_direct(session);
+    } else {
+        session_connect_relay(session);
+    }
+}
+
+/*
+ * The platform granted a request. This device checks the grant's signature and that the grant
+ * names it as the initiator. Who the other end is, the handshake shows: it holds the shared key or not.
+ */
+static void handle_grant(cz_agent *agent, cz_session *session, cz_span data)
+{
+    char session_id[CZ_ID_SIZE];
+    char peer_name[CZ_NAME_SIZE];
+    bool peer_direct;
+    char *token = read_grant_message(data, session_id, sizeof session_id, peer_name, sizeof peer_name, &peer_direct);
+    session->request_id = 0;
+    if (token == NULL) {
+        session_end(session, "GRANT_INVALID", false);
+        return;
+    }
+    refresh_grant_keys(agent, token);
+
+    const char *refusal = cz_grant_verify(token, agent->grant_keys, agent->grant_key_count, agent_now(agent), true, (uint8_t *)agent->scratch, BUFFER_SIZE, &session->grant);
+    bool direct = false;
+    if (refusal == NULL) {
+        direct = session->grant.mode_direct && agent->peer_to_peer && peer_direct;
+        if (strcmp(session->grant.session_id, session_id) != 0 || strcmp(session->grant.initiator_id, agent->device_id) != 0) {
+            refusal = "GRANT_INVALID";
+        } else if (session->grant.mode_compatibility) {
+            refusal = "NO_PERMITTED_MODE";
+        } else if (!session->grant.shared_key) {
+            refusal = "E2E_NO_COMMON_METHOD";
+        } else if (!direct && !(session->grant.mode_relay && session->grant.relay_url[0] != '\0')) {
+            refusal = "NO_PERMITTED_MODE";
+        }
+    }
+    if (refusal != NULL) {
+        /* The platform still learns that the session it granted did not start. */
+        memset(&session->grant, 0, sizeof session->grant);
+        cz_copy(session->grant.session_id, sizeof session->grant.session_id, session_id);
+        free(token);
+        session_end(session, refusal, false);
+        return;
+    }
+
+    session_take_grant(session, token, peer_direct);
+    session->direct_wanted = direct;
+    if (!direct) {
+        cz_copy(session->direct_failure, sizeof session->direct_failure,
+                !agent->peer_to_peer || !peer_direct ? "peer_no_direct_support" : "policy_relay_only");
+    }
+    session_set_phase(session, PHASE_ANSWER);
+    if (strcmp(agent->early_answer, session_id) == 0) {
+        agent->early_answer[0] = '\0';
+        link_answered(session, agent->early_accept, agent->early_error);
+    }
+}
+
+static void handle_answer(cz_agent *agent, cz_span data)
+{
+    char session_id[CZ_ID_SIZE] = "";
+    char error[40] = "";
+    cz_span value;
+    bool accept = false;
+    text_member(data, "sid", session_id, sizeof session_id);
+    text_member(data, "error", error, sizeof error);
+    if (cz_json_member(data, "accept", &value)) {
+        cz_json_bool(value, &accept);
+    }
+    bool requesting = false;
+    for (int i = 0; i < SESSION_SLOTS; i++) {
+        cz_session *session = agent->sessions[i];
+        if (session == NULL || session->ended || !session->initiator) {
+            continue;
+        }
+        if (session->phase == PHASE_ANSWER && strcmp(session->grant.session_id, session_id) == 0) {
+            link_answered(session, accept, error);
+            return;
+        }
+        requesting = requesting || session->phase == PHASE_REQUEST;
+    }
+    if (requesting && session_id[0] != '\0') {
+        /* The answer overtook the grant it belongs to: it is kept until the grant is here. */
+        cz_copy(agent->early_answer, sizeof agent->early_answer, session_id);
+        agent->early_accept = accept;
+        cz_copy(agent->early_error, sizeof agent->early_error, error);
+    }
+}
+
+static bool reply_to(const char *re, char kind, uint32_t id)
+{
+    char expected[16];
+    snprintf(expected, sizeof expected, "%c%u", kind, (unsigned)id);
+    return id != 0 && strcmp(re, expected) == 0;
+}
+
+/* The session this device opened whose request of that kind has the id a reply names, or NULL. */
+static cz_session *find_requester(cz_agent *agent, const char *re, char kind)
+{
+    for (int i = 0; i < SESSION_SLOTS; i++) {
+        cz_session *session = agent->sessions[i];
+        if (session != NULL && !session->ended && session->initiator && reply_to(re, kind, kind == 'c' ? session->request_id : session->lease_request_id)) {
+            return session;
+        }
+    }
+    return NULL;
+}
+
+/* A new grant for a running session: the device and the relay are shown it, so that they keep the session open. */
+static void handle_lease_grant(cz_agent *agent, cz_session *session, cz_span data)
+{
+    cz_span value;
+    char *token = NULL;
+    cz_grant renewed;
+    session->lease_request_id = 0;
+    session->lease_renew_at = agent_now(agent) + LEASE_RETRY_SECONDS;
+    if (cz_json_member(data, "grant", &value) && value.length > 2) {
+        token = (char *)malloc(value.length);
+    }
+    if (token == NULL || !cz_json_string(value, token, value.length) || !session->established
+        || cz_grant_verify(token, agent->grant_keys, agent->grant_key_count, agent_now(agent), false, (uint8_t *)agent->scratch, BUFFER_SIZE, &renewed) != NULL
+        || strcmp(renewed.session_id, session->grant.session_id) != 0 || strcmp(renewed.workspace_id, session->grant.workspace_id) != 0
+        || strcmp(renewed.initiator_id, session->grant.initiator_id) != 0 || strcmp(renewed.device_id, session->grant.device_id) != 0
+        || renewed.shared_key != session->grant.shared_key) {
+        free(token);
+        return;
+    }
+    int64_t expires = renewed.issued_at + renewed.lease_seconds;
+    if (expires > session->lease_expires) {
+        session->lease_expires = expires;
+    }
+    session->lease_renew_at = agent_now(agent) + (session->lease_expires - agent_now(agent)) / 2;
+
+    uint8_t *payload = session_payload(session);
+    int length = snprintf((char *)payload + 4, MAX_DATA - 4, "{\"lease\":{\"grant\":\"%s\"}}", token);
+    if (length > 0 && length < MAX_DATA - 4) {
+        put32(payload, (uint32_t)length);
+        stream_send(session, &session->control, (size_t)length + 4);
+    }
+    if (!session->ended && !session->direct && session->relay.conn != NULL) {
+        char *text = agent->scratch + CZ_WS_HEADROOM;
+        length = snprintf(text, BUFFER_SIZE - CZ_WS_HEADROOM, "{\"t\":\"lease\",\"grant\":\"%s\"}", token);
+        if (length > 0 && length < BUFFER_SIZE - CZ_WS_HEADROOM) {
+            cz_ws_send(&session->relay, true, (uint8_t *)text, (size_t)length);
+        }
+    }
+    free(token);
+}
+
+/* A connection to a link's port becomes a stream to the service. True when the stream took the connection. */
+static bool link_open_stream(cz_session *session, int fd)
+{
+    cz_stream *stream = NULL;
+    for (int i = 0; i < CZ_MAX_STREAMS && stream == NULL; i++) {
+        if (!session->streams[i].used) {
+            stream = &session->streams[i];
+        }
+    }
+    if (stream == NULL) {
+        return false;
+    }
+    memset(stream, 0, sizeof *stream);
+    stream->used = true;
+    stream->local = true;
+    stream->id = session->next_stream;
+    stream->fd = fd;
+    stream->send_window = INITIAL_WINDOW;
+    session->next_stream += 2;
+
+    char json[CZ_NAME_SIZE * 2 + 16];
+    int length = snprintf(json, sizeof json, "{\"svc\":");
+    length += cz_json_quote(json + length, sizeof json - (size_t)length, session->link->service);
+    snprintf(json + length, sizeof json - (size_t)length, "}");
+    stream_send_json(session, stream, 2, json);
+    return true;
+}
+
+/* What is due for the links: their ports, the connections that wait, and sessions nobody uses. */
+static void links_tick(cz_agent *agent, fd_set *readable)
+{
+    for (int n = 0; n < agent->link_count; n++) {
+        cz_link_entry *link = &agent->links[n];
+        if (link->listen_fd < 0) {
+            /* The port is opened once the device is online: before that the network may not be up. */
+            if (agent->welcomed && !link->listen_failed) {
+                link_listen(agent, link);
+            }
+            continue;
+        }
+        if (FD_ISSET(link->listen_fd, readable)) {
+            int fd = (int)accept(link->listen_fd, NULL, NULL);
+            for (int i = 0; i < LINK_PENDING && fd >= 0; i++) {
+                if (link->pending[i] < 0) {
+                    cz_socket_set_nonblocking(fd);
+                    link->pending[i] = fd;
+                    fd = -1;
+                }
+            }
+            cz_socket_close(fd);
+        }
+
+        bool waiting = false;
+        for (int i = 0; i < LINK_PENDING; i++) {
+            waiting = waiting || link->pending[i] >= 0;
+        }
+        cz_session *session = link->session;
+        if (session == NULL) {
+            if (waiting && agent->welcomed) {
+                link_start(agent, link);
+            }
+            continue;
+        }
+        if (session->ended || session->phase != PHASE_OPEN) {
+            continue;
+        }
+        for (int i = 0; i < LINK_PENDING && !session->ended; i++) {
+            if (link->pending[i] >= 0 && link_open_stream(session, link->pending[i])) {
+                link->pending[i] = -1;
+            }
+        }
+        if (session->ended) {
+            continue;
+        }
+        bool busy = false;
+        for (int i = 0; i < LINK_PENDING; i++) {
+            busy = busy || link->pending[i] >= 0;
+        }
+        for (int i = 0; i < CZ_MAX_STREAMS; i++) {
+            busy = busy || session->streams[i].used;
+        }
+        if (busy) {
+            link->idle = false;
+        } else if (!link->idle) {
+            link->idle = true;
+            link->idle_since = cz_millis();
+        } else if (elapsed(link->idle_since, LINK_IDLE_MS)) {
+            session_end(session, "SESSION_CLOSED", true);
+        }
+    }
 }
 
 /* ---- Signaling: receiving ------------------------------------------------------------------ */
@@ -1796,7 +2565,7 @@ static void agent_refused(cz_agent *agent, const char *code)
 {
     cz_copy(agent->last_error, sizeof agent->last_error, code);
     agent_log(agent, "the platform does not accept this device (%s); stopped", code);
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] != NULL) {
             session_end(agent->sessions[i], code, true);
         }
@@ -1844,6 +2613,43 @@ static void handle_signal(cz_agent *agent, cz_span message)
             cz_copy(agent->last_error, sizeof agent->last_error, code);
             signal_close(agent);
         }
+    } else if (strcmp(type, "error") == 0) {
+        /* The platform's refusal of something a session of this device asked for. */
+        char re[16] = "";
+        char code[40] = "INVALID_REQUEST";
+        text_member(message, "re", re, sizeof re);
+        text_member(data, "code", code, sizeof code);
+        cz_session *session = find_requester(agent, re, 'c');
+        if (session != NULL) {
+            session->request_id = 0;
+            agent_log(agent, "link to %s: no session (%s)", session->peer_name, code);
+            session_end(session, code, false);
+        } else if ((session = find_requester(agent, re, 'l')) != NULL) {
+            session->lease_request_id = 0;
+            session->lease_renew_at = agent_now(agent) + LEASE_RETRY_SECONDS;
+            bool gone = strcmp(code, "NOT_FOUND") == 0 || strcmp(code, "SESSION_CLOSED") == 0;
+            if (gone || strcmp(code, "CREDENTIAL_REVOKED") == 0 || strcmp(code, "DEVICE_REVOKED") == 0 || strcmp(code, "FORBIDDEN") == 0
+                || strcmp(code, "SERVICE_DISABLED") == 0 || strcmp(code, "SERVICE_NOT_EXPOSED") == 0) {
+                /* Authorisation is gone: the session ends at once and not at the end of its lease. */
+                session_end(session, gone ? "SESSION_REVOKED" : code, true);
+            }
+        }
+    } else if (strcmp(type, "connect.grant") == 0) {
+        char re[16] = "";
+        text_member(message, "re", re, sizeof re);
+        cz_session *session = find_requester(agent, re, 'c');
+        if (session != NULL) {
+            handle_grant(agent, session, data);
+        }
+    } else if (strcmp(type, "connect.answer") == 0) {
+        handle_answer(agent, data);
+    } else if (strcmp(type, "lease.grant") == 0) {
+        char re[16] = "";
+        text_member(message, "re", re, sizeof re);
+        cz_session *session = find_requester(agent, re, 'l');
+        if (session != NULL) {
+            handle_lease_grant(agent, session, data);
+        }
     } else if (strcmp(type, "connect.offer") == 0) {
         handle_offer(agent, data);
     } else if (strcmp(type, "path.candidates") == 0) {
@@ -1854,13 +2660,16 @@ static void handle_signal(cz_agent *agent, cz_span message)
     } else if (strcmp(type, "path.fallback") == 0) {
         cz_session *session = find_session(agent, data);
         /* The initiator found no direct path; a handshake that was under way on one is abandoned. */
-        if (session != NULL && session->direct && !session->established) {
+        if (session != NULL && !session->initiator && session->direct && !session->established) {
             char stranger[64] = "none";
             if (session->d != NULL && endpoint_set(session->d->unannounced)) {
                 format_endpoint(session->d->unannounced, stranger, sizeof stranger);
             }
             agent_log(agent, "session %s: no direct path, using the relay (probes received: %d, from an unannounced address: %s)",
                       session->grant.session_id, session->d != NULL ? session->d->probes_received : 0, stranger);
+            if (session->d != NULL) {
+                direct_log_summary(session);
+            }
             direct_close(session->d, false);
             session->d = NULL;
             /* Whatever had begun on the direct path is void; on the relay everything starts again. */
@@ -1882,7 +2691,7 @@ static void handle_signal(cz_agent *agent, cz_span message)
         cz_span list;
         bool all = !cz_json_member(data, "sids", &list) || list.length < 2 || list.at[0] != '[';
         text_member(data, "reason", reason, sizeof reason);
-        for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+        for (int i = 0; i < SESSION_SLOTS; i++) {
             cz_session *session = agent->sessions[i];
             if (session != NULL && !session->ended && (all || cz_json_contains(list, session->grant.session_id))) {
                 session_end(session, reason, true);
@@ -2075,7 +2884,19 @@ void cz_agent_poll(cz_agent *agent, int max_wait_ms)
         add_fd(cz_ws_fd(&agent->signal), &readable, &highest);
         immediately = immediately || cz_ws_pending(&agent->signal);
     }
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int n = 0; n < agent->link_count && agent->welcomed; n++) {
+        /* A link's port is listened to while there is room for another connection to wait. */
+        cz_link_entry *link = &agent->links[n];
+        bool room = false;
+        for (int i = 0; i < LINK_PENDING; i++) {
+            room = room || link->pending[i] < 0;
+        }
+        if (room) {
+            add_fd(link->listen_fd, &readable, &highest);
+        }
+        immediately = immediately || (link->listen_fd < 0 && !link->listen_failed);
+    }
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         cz_session *session = agent->sessions[i];
         if (session == NULL || session->ended) {
             immediately = immediately || session != NULL;
@@ -2136,8 +2957,10 @@ void cz_agent_poll(cz_agent *agent, int max_wait_ms)
         }
     }
 
+    links_tick(agent, &readable);
+
     /* The sessions. */
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         cz_session *session = agent->sessions[i];
         if (session == NULL) {
             continue;
@@ -2164,13 +2987,28 @@ void cz_agent_poll(cz_agent *agent, int max_wait_ms)
             ikcp_flush(session->d->kcp); /* what was just written leaves now rather than at the next tick */
         }
         if (!session->ended) {
-            if (session->phase == PHASE_PAIRING && elapsed(session->phase_started, PAIR_TIMEOUT_MS)) {
+            if ((session->phase == PHASE_REQUEST || session->phase == PHASE_ANSWER) && elapsed(session->phase_started, ANSWER_TIMEOUT_MS)) {
+                session_end(session, "SIGNALING_TIMEOUT", false);
+            } else if (session->phase == PHASE_PAIRING && elapsed(session->phase_started, PAIR_TIMEOUT_MS)) {
                 session_end(session, "RELAY_PEER_TIMEOUT", false);
             } else if ((session->phase == PHASE_HANDSHAKE || session->phase == PHASE_BIND) && elapsed(session->phase_started, HANDSHAKE_TIMEOUT_MS)) {
                 session_end(session, "E2E_HANDSHAKE_FAILED", false);
             } else if (session->established && agent_now(agent) >= session->lease_expires + LEASE_GRACE_SECONDS) {
                 /* A session whose authorisation ran out is ended, whatever the platform or the peer say. */
                 session_end(session, "LEASE_EXPIRED", true);
+            } else if (session->initiator && session->established && agent->welcomed) {
+                if (session->lease_request_id != 0 && elapsed(session->lease_asked_at, ANSWER_TIMEOUT_MS)) {
+                    session->lease_request_id = 0; /* no answer: asked again shortly */
+                    session->lease_renew_at = agent_now(agent) + LEASE_RETRY_SECONDS;
+                }
+                if (session->lease_request_id == 0 && agent_now(agent) >= session->lease_renew_at) {
+                    size_t capacity;
+                    char *json = signal_buffer(agent, &capacity);
+                    session->lease_request_id = ++agent->message_id;
+                    session->lease_asked_at = cz_millis();
+                    signal_send(agent, snprintf(json, capacity, "{\"t\":\"lease.request\",\"id\":\"l%u\",\"d\":{\"sid\":\"%s\"}}",
+                                                (unsigned)session->lease_request_id, session->grant.session_id));
+                }
             }
         }
         if (session->ended) {
@@ -2184,7 +3022,7 @@ void cz_agent_run(cz_agent *agent)
     while (!agent->stop) {
         cz_agent_poll(agent, 100);
     }
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] != NULL) {
             session_end(agent->sessions[i], "SESSION_CLOSED", true);
             session_free(agent->sessions[i]);
@@ -2207,9 +3045,13 @@ void cz_agent_get_status(const cz_agent *agent, cz_status *out)
 {
     memset(out, 0, sizeof *out);
     out->state = agent->state;
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] != NULL && agent->sessions[i]->established) {
-            out->sessions++;
+            if (agent->sessions[i]->initiator) {
+                out->links++;
+            } else {
+                out->sessions++;
+            }
         }
     }
     cz_copy(out->last_error, sizeof out->last_error, agent->last_error);
@@ -2268,8 +3110,35 @@ cz_agent *cz_agent_create(const cz_config *config)
         entry->port = service->port;
         agent->service_count++;
     }
+    for (int i = 0; problem == NULL && i < CZ_MAX_LINKS; i++) {
+        const cz_link *link = &config->links[i];
+        if (link->device == NULL) {
+            continue;
+        }
+        cz_link_entry *entry = &agent->links[agent->link_count];
+        if (link->device[0] == '\0' || strlen(link->device) >= sizeof entry->device || link->service == NULL || link->service[0] == '\0'
+            || strlen(link->service) >= sizeof entry->service || link->local_port == 0) {
+            problem = "a link needs the other device's name, one of its services and a local port";
+            break;
+        }
+        if (link->shared_key == NULL) {
+            memcpy(entry->key, agent->keys[0], CZ_KEY_SIZE);
+        } else if (!cz_shared_key_parse(link->shared_key, entry->key)) {
+            problem = "the shared key of a link is not valid; it looks like czs_ followed by 43 characters";
+            break;
+        }
+        cz_copy(entry->device, sizeof entry->device, link->device);
+        cz_copy(entry->service, sizeof entry->service, link->service);
+        entry->port = link->local_port;
+        entry->listen_fd = -1;
+        for (int k = 0; k < LINK_PENDING; k++) {
+            entry->pending[k] = -1;
+        }
+        agent->link_count++;
+    }
     if (problem != NULL) {
         agent_log(agent, "connectivitizer: %s", problem);
+        memset(agent, 0, sizeof *agent);
         free(agent);
         return NULL;
     }
@@ -2291,11 +3160,16 @@ void cz_agent_destroy(cz_agent *agent)
     if (agent == NULL) {
         return;
     }
-    for (int i = 0; i < CZ_MAX_SESSIONS; i++) {
+    for (int i = 0; i < SESSION_SLOTS; i++) {
         if (agent->sessions[i] != NULL) {
             session_end(agent->sessions[i], "SESSION_CLOSED", true);
             session_free(agent->sessions[i]);
         }
+    }
+    for (int i = 0; i < agent->link_count; i++) {
+        link_drop_pending(&agent->links[i]);
+        cz_socket_close(agent->links[i].listen_fd);
+        memset(agent->links[i].key, 0, sizeof agent->links[i].key);
     }
     signal_close(agent);
     memset(agent->keys, 0, sizeof agent->keys);

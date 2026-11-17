@@ -11,3 +11,8 @@ connected	KEYWORD2
 refused	KEYWORD2
 sessions	KEYWORD2
 lastError	KEYWORD2
+link	KEYWORD2
+linkPort	KEYWORD2
+get	KEYWORD2
+post	KEYWORD2
+links	KEYWORD2
